@@ -8,6 +8,7 @@
 - [training/](./training/) — 分布式训练、并行策略(DP/TP/PP/EP)、Megatron、DeepSpeed、FSDP
 - [inference/](./inference/) — 推理引擎(vLLM、SGLang、TensorRT-LLM)、KV Cache、量化、投机解码
 - [systems/](./systems/) — 调度、存储、网络(RDMA、IB)、容器化
+- [kernel-verification/](./kernel-verification/) — GPU kernel 正确性验证、数值一致性、自动生成
 - [papers/](./papers/) — 论文阅读笔记
 - [daily/](./daily/) — 按日期记录的学习日志
 - [assets/](./assets/) — 图片等资源
