@@ -41,9 +41,9 @@ GPU kernel 正确性验证、数值一致性、自动生成与测试相关的资
       3. **Reward Smoothing**：reward 先标准化 `(r−μ)/σ`，再 **clip 到 [−k, k]**，论文取 **k = 1.5**。理由是"1.5× 已经算大胜"，再高大概率是 hack 而不是真本事——**用先验上限直接压住"暴富信号"**，让 RL 不会一头扎进某个 outlier。这条是和 GRPO 配合的关键改动（对应 §2.4.5 里那句"reward 喂进 GRPO 之前先 smoothing"）。
     - **对 kernel-verification 主题的启示**：§3.1 的四种 hack **本质上全是攻击 verifier**——timer、materialization 检查、超参约束、tolerance 比较，每一个都是验证管线里的薄弱环节。一个"能扛住对抗 RL 的 verifier"才是真正合格的 verifier；这套案例库可以直接当作 verification 系统的 red-team 测试集。
 
-- [arXiv 2512.23236](https://arxiv.org/abs/2512.23236) — *待补充笔记*
+### 2. [arXiv 2512.23236](https://arxiv.org/abs/2512.23236) — *待补充笔记*
 
 ## 代码仓库
 
-- [meta-pytorch/KernelAgent](https://github.com/meta-pytorch/KernelAgent) — Meta PyTorch 出品的 kernel 生成 agent
-- [thinking-machines-lab/batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops) — batch 不变性算子,用于推理数值一致性
+### 1. [meta-pytorch/KernelAgent](https://github.com/meta-pytorch/KernelAgent) — Meta PyTorch 出品的 kernel 生成 agent
+### 2. [thinking-machines-lab/batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops) — batch 不变性算子,用于推理数值一致性
