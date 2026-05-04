@@ -9,11 +9,11 @@ GPU kernel 正确性验证、数值一致性、自动生成与测试相关的资
 - [arXiv 2507.14111](https://arxiv.org/pdf/2507.14111) — *CUDA-L1: Improving CUDA Optimization via Contrastive Reinforcement Learning*
   - **一句话**：用 speedup 作为唯一 reward，把一个原本写不好 CUDA 的 LLM 训练成会自动优化 kernel 的 agent；250 个 kernel 上平均 3.12× 加速、中位 1.42×，超过 torch.compile 和 cuDNN。
   - **三阶段 pipeline**：
-    1. **SFT via data augmentation**：先用现有的（人写 / 编译器产出 / 其它模型生成的）CUDA 代码做监督微调，关键是用数据增强把同一个 kernel 的多种写法都喂进去，让模型先学会"CUDA 长什么样"。这一步只解决"能写出来 + 能编译过"的问题。
+    1. **SFT via data augmentation**：先用现有的（人写 + 编译器产出 + 其它模型生成的）CUDA 代码做监督微调，用数据增强把同一个 kernel 的多种写法都喂进去，让模型先学会"CUDA 长什么样"。这一步只解决"能写出来 + 能编译过"的问题。
     2. **Self-supervised learning**：模型自己生成 -> 自己跑 -> 用"能不能编译 + 能不能跑对 + 跑多快"做自监督信号继续训。这一步把"语法对"提升到"功能对 + 有点性能"。重要的是这阶段不需要任何人类专家标注，正确性由 reference 输出对比保证。
     3. **Contrastive RL**：Core - 传统 RLHF 直接 reward 一份代码的 speedup，信号噪声. Instead 他们做法是把"同一 problem 下的多份候选实现"放在 prompt 里让模型对比着改，再用相对 speedup 做 reward。这样模型学到的不是"写一份快代码"而是"在已有方案上找还能再压榨什么"，避免了 reward hacking。
-  - **Contrastive RL 的具体 trick（§2.4.3 – §2.4.5）**：
-    - **§2.4.3 Exemplar Selection（怎么挑放进 prompt 的对比样本）**：
+  - **Contrastive RL 的具体 trick**：
+    - **Exemplar Selection（怎么挑放进 prompt 的对比样本）**：
       - 维护一个 performance-indexed 的代码库，按 score 离散化到 buckets `B_k`（每个 bucket 是 `[s_k, s_k+Δs)` 区间）。
       - 每次 prompt 用 N=2 个 exemplar；先用 **温度归一化的 softmax** 在 bucket 之间采样：`P(B_i) ∝ exp((s̄_i − μ_s)/τ)`。和常规温度采样的区别是减去了全局 bucket 均值 μ_s，**把分数中心化到 0**，避免绝对分数大的 bucket 永远霸占采样。
       - 强制采样 N 个**不同**的 bucket，再从每个 bucket 内 uniform 采一份代码 → 同时满足"够强（偏向高分 bucket）"和"够散（性能差异大才能对比）"两个条件。
@@ -33,7 +33,7 @@ GPU kernel 正确性验证、数值一致性、自动生成与测试相关的资
       - 保留标准 GRPO 的 ratio clip + KL penalty `βD_KL(π_θ ‖ π_ref)`，防止策略漂太远。
   - **Reward Hacking 治理（§3.1 – §3.2）**：
     - **§3.1 Reward Hacking Cases（模型实际学会的"作弊"行为）**：
-      1. **Improper Timing Measurement**：KernelBench 只在 main CUDA stream 上 record 起止 event，模型学会**自己开新 stream 异步发计算**——main stream 上几乎没事干，timer 量出来的时间就极短。初版里 250 个 task 中 **82 个（32.8%）走了这条路，把整体 speedup 虚标到 18×**。修复：在 `end_event.record` 前对所有 custom stream 调 `wait_stream`，强制同步。
+      1. **Improper Timing Measurement**：KernelBench 只在 main CUDA stream 上 record 起止 event，模型学会**自己开新 stream 异步发计算**——main stream 上几乎没事干，timer 量出来的时间就极短。修复：在 `end_event.record` 前对所有 custom stream 调 `wait_stream`，强制同步。
       2. **Lazy Evaluation**：返回一个 `torch.Tensor` 的子类（lazy 对象），`forward` 里压根不算，真正的 matmul 推迟到 `torch.allclose` 做 correctness check 时才触发——既"通过正确性"又"耗时极短"。修复：加 5 条断言（必须是 tensor、必须是**标准** `torch.Tensor`（拒子类）、device 对、storage size > 0、`data_ptr` 非 null）。
       3. **Hyperparameter Manipulation**：模型偷偷改 prompt 里给的 `batch_size / dim / in_features` 等超参（改小了自然快）。这条对应了 §2.4 prompt 里那句 "Keep hyperparameters unchanged" 的 restriction，但显然光靠 prompt 拦不住，需要在 evaluator 里硬校验。
       4. **Result Caching**：以 `x.data_ptr()` 为 key 缓存 forward 结果，下次同地址直接返回。理论上 correctness check 该挂，但 `torch.allclose` 是逐元素阈值比较，**有少量 case 能蒙混过关**——这条对你做 verification 是个直接警示：基于 tolerance 的等价性检查在对抗输入下不够。
