@@ -2,11 +2,9 @@
 
 GPU kernel 正确性验证、数值一致性、自动生成与测试相关的资料与笔记。
 
-## 资料清单
+## 论文
 
-### 论文
-
-- [arXiv 2507.14111](https://arxiv.org/pdf/2507.14111) — *CUDA-L1: Improving CUDA Optimization via Contrastive Reinforcement Learning*
+### 1. [arXiv 2507.14111](https://arxiv.org/pdf/2507.14111) — *CUDA-L1: Improving CUDA Optimization via Contrastive Reinforcement Learning*
   - **一句话**：用 speedup 作为唯一 reward，把一个原本写不好 CUDA 的 LLM 训练成会自动优化 kernel 的 agent；250 个 kernel 上平均 3.12× 加速、中位 1.42×，超过 torch.compile 和 cuDNN。
   - **三阶段 pipeline**：
     1. **SFT via data augmentation**：先用现有的（人写 + 编译器产出 + 其它模型生成的）CUDA 代码做监督微调，用数据增强把同一个 kernel 的多种写法都喂进去，让模型先学会"CUDA 长什么样"。这一步只解决"能写出来 + 能编译过"的问题。
@@ -45,7 +43,7 @@ GPU kernel 正确性验证、数值一致性、自动生成与测试相关的资
 
 - [arXiv 2512.23236](https://arxiv.org/abs/2512.23236) — *待补充笔记*
 
-### 代码仓库
+## 代码仓库
 
 - [meta-pytorch/KernelAgent](https://github.com/meta-pytorch/KernelAgent) — Meta PyTorch 出品的 kernel 生成 agent
 - [thinking-machines-lab/batch_invariant_ops](https://github.com/thinking-machines-lab/batch_invariant_ops) — batch 不变性算子,用于推理数值一致性
