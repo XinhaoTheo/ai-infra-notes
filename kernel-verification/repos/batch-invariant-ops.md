@@ -75,13 +75,20 @@ Attention is the toughest because it contains two matmuls and reduces over both 
 
 **Fix:** Write current K/V into the KV cache before the attention kernel runs, so the kernel always sees a single, consistently-laid-out block of data — independent of which inference stage produced it.
 
-![Inconsistent KV layout — before fix](../pics/attention-03.svg)
-
-![Consistent KV layout — after fix](../pics/attention-04.svg)
-
 **Problem 2:** Split-KV (FlashDecoding). During decoding, query length is 1, so parallelism along Q is essentially zero. With long KV caches, a single core would take forever. Engines therefore split the KV dimension across cores — **but the standard strategy ("fixed number of splits") gives different per-split sizes for different KV lengths, breaking invariance.**
 
 **Fix:** Fixed split size, not fixed split count. Always use chunks of e.g. 256 elements. The number of chunks varies with KV length, but each chunk's internal reduction is always the same. Reduction order is preserved regardless of how many query tokens are being processed.
+
+<table>
+<tr>
+<td><img src="../pics/attention-03.svg" alt="Fixed split count — before fix" width="100%"></td>
+<td><img src="../pics/attention-04.svg" alt="Fixed split size — after fix" width="100%"></td>
+</tr>
+<tr>
+<td align="center"><sub>修复前：fixed split count（4×250），KV 长度变 → 每块大小变</sub></td>
+<td align="center"><sub>修复后：fixed split size（256/256/256/232），归约顺序不变</sub></td>
+</tr>
+</table>
 
 ### 5. Implementation and Empirical Validation
 Determinism test: With Qwen3-235B at temperature 0, the prompt "Tell me about Richard Feynman" generates 80 different completions across 1000 runs with default vLLM. They all agree for the first 102 tokens, then diverge — most produce "Queens, New York", a few produce "New York City". With batch-invariant kernels enabled: all 1000 completions are bitwise identical.
