@@ -75,6 +75,10 @@ Attention is the toughest because it contains two matmuls and reduces over both 
 
 **Fix:** Write current K/V into the KV cache before the attention kernel runs, so the kernel always sees a single, consistently-laid-out block of data — independent of which inference stage produced it.
 
+![Inconsistent KV layout — before fix](../pics/attention-03.svg)
+
+![Consistent KV layout — after fix](../pics/attention-04.svg)
+
 **Problem 2:** Split-KV (FlashDecoding). During decoding, query length is 1, so parallelism along Q is essentially zero. With long KV caches, a single core would take forever. Engines therefore split the KV dimension across cores — **but the standard strategy ("fixed number of splits") gives different per-split sizes for different KV lengths, breaking invariance.**
 
 **Fix:** Fixed split size, not fixed split count. Always use chunks of e.g. 256 elements. The number of chunks varies with KV length, but each chunk's internal reduction is always the same. Reduction order is preserved regardless of how many query tokens are being processed.
@@ -94,3 +98,5 @@ Horace's experiments on BigMath with Qwen 2.5-VL 8B compare three configurations
 - True on-policy (batch-invariant kernels in both sampler and trainer): KL divergence is exactly 0 throughout training. No importance weighting needed. Training is stable.
 
 In other words: batch invariance lets us drop the importance-weighting term entirely and recover truly on-policy RL. This simplifies algorithms (PPO's `min(ratio·A, clip(ratio)·A)` collapses back to a vanilla policy gradient), removes a hyperparameter (clip range), and makes training fundamentally more stable.
+
+![Figure 16 — Reward & KL divergence: True on-policy vs. importance weighting vs. no correction](../pics/Snipaste_2026-05-06_13-43-59.png)
