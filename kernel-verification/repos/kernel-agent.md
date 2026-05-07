@@ -4,33 +4,42 @@
 
 Meta PyTorch 出品的 kernel 生成 agent：从 PyTorch 程序自动产出 *已验证* 的 Triton kernel，再做硬件感知的性能优化。
 
-## Part 1 — 整个流水线怎么转
+## Part 1 — whole pipeline
 
-KernelAgent 本质是一条 **「PyTorch 程序 → 多个 Triton kernel → 拼回完整程序」** 的多 agent 流水线。从外到内有 3 层。
+KernelAgent 本质是一条 **「PyTorch 程序 → 多个 Triton kernel → 拼回完整程序」** 的multi-agent 流水线。从外到内有 3 层。
 
 ![KernelAgent 生成流水线：AutoRouter → Fuser (Orchestrator/Extractor/Dispatcher/Composer) → Verified Triton Kernels；Direct 路径直接打到 KernelAgent Multi-Worker](../pics/kernelagent2.excalidraw.svg)
 
-**最外层：AutoRouter 路由**。`Fuser/auto_agent.py` 用 AST 静态扫一遍输入：碰到 attention block、转置卷积、控制流、长 op 链，就走"完整 Fuser 流水线"；否则把整个问题当一个 kernel 直接交给内层 agent。决策结果落到 `.fuse/router_cache.json`，下次同问题不再算；而且支持失败 fallback（直接路径挂了换 Fuser，反之亦然）。
+1. **最外层：AutoRouter**。`Fuser/auto_agent.py` 用 AST 静态扫一遍输入：碰到 attention block、转置卷积、控制流、长 op 链，就走"完整 Fuser 流水线"；否则把整个问题当一个 kernel 直接交给内层 agent。决策结果落到 `.fuse/router_cache.json`，下次同问题不再算；而且支持失败 fallback（直接路径挂了换 Fuser，反之亦然）。
 
-**中间层：Fuser 流水线（针对复杂模型）**。`Orchestrator` 先把 PyTorch 模型重写成可融合模块并跑一遍等价性检查；`SubgraphExtractor` 调 LLM 输出 `subgraphs.json`，把整张图切成若干独立子图，再用 shape signature 去重（同形状只生成一次）；`Dispatcher` 把每个子图作为一份"problem spec"喂给一个 `TritonKernelAgent` 实例并发跑（默认 `ThreadPoolExecutor` + 每个线程内 4 个进程）；最后 `Composer` 把所有验证过的 kernel 拼成一个 `composed_kernel.py` 并跑端到端等价性测试。每一步的产物都落到 `.fuse/<run_id>/` 下的不同子目录，断点续跑友好。
+2. **中间层：Fuser 流水线（针对复杂模型）**。
+    - `Orchestrator` 先把 PyTorch 模型重写成可融合模块并跑一遍等价性检
+    - `SubgraphExtractor` 调 LLM 输出 `subgraphs.json`，把整张图切成若干独立子图，再用 shape signature 去重（同形状只生成一次）；
+    - `Dispatcher` 把每个子图作为一份"problem spec"喂给一个 
+    - `TritonKernelAgent` 实例并发跑（默认 `ThreadPoolExecutor` + 每个线程内 4 个进程）；
+    - 最后 `Composer` 把所有验证过的 kernel 拼成一个 `composed_kernel.py` 并跑端到端等价性测试。每一步的产物都落到 `.fuse/<run_id>/` 下的不同子目录，断点续跑友好。
 
-**最内层：单个 kernel 的 agent loop**。这是流水线里被反复调用的子程序。`TritonKernelAgent.generate_kernel()` 收到一个问题描述后：① 先用 `test_generation.j2` 模板让 LLM 写一份测试代码；② 用 `kernel_generation.j2` 模板生成 N 个 kernel seed（provider 支持就一次拿 N 份，否则循环 N 次配不同 temperature）；③ 把 N 个 seed 交给 `WorkerManager`，对每个 seed 在独立 tempdir 里 fork 一个 `VerificationWorker` 进程；④ 每个 worker 在自己进程里跑"写 kernel → subprocess 跑测试 → 把 stderr+history 喂回 LLM 让它改"的小循环，最多 `max_rounds`（默认 10）轮；⑤ 用 `mp.Event` 做"谁先 PASS 大家就停"的同步——任意一个 worker 退出码 0，event set，其他 worker 立即 return。
+3. **最内层：单个 kernel 的 agent loop**。这是流水线里被反复调用的子程序。`TritonKernelAgent.generate_kernel()` 收到一个问题描述后：
+    - ① 先用 `test_generation.j2` 模板让 LLM 写一份测试代码；
+    - ② 用 `kernel_generation.j2` 模板生成 N 个 kernel seed（provider 支持就一次拿 N 份，否则循环 N 次配不同 temperature）；
+    - ③ 把 N 个 seed 交给 `WorkerManager`，对每个 seed 在独立 tempdir 里 fork 一个 `VerificationWorker` 进程；
+    - ④ 每个 worker 在自己进程里跑"写 kernel → subprocess 跑测试 → 把 stderr+history 喂回 LLM 让它改"的小循环，最多 `max_rounds`（默认 10）轮；
+    - ⑤ 用 `mp.Event` 做"谁先 PASS 大家就停"的同步——任意一个 worker 退出码 0，event set，其他 worker 立即 return。
 
 **外层 vs 内层的"并行"语义不同**：Fuser 的并行 = 不同问题（子图 A/B/C 同时被解），agent loop 的并行 = 同一个问题（4 个 seed 抢答）。所以 Dispatcher 起 4 线程 × 每线程 4 worker，实际并发 ~16 个 Python 子进程。
 
-**优化流水线（独立的第二条主线）**。`triton_kernel_agent/opt_worker.py` + `kernel_perf_agent/` 跑一个 6 步硬件感知循环：NCU 采 28 个指标 → roofline 把 kernel 分类成 memory/compute/under-util → LLM 诊断瓶颈 → 从知识库（TMA / persistence / PID swizzle 等代码样例）检索"对症"技巧塞进 prompt → LLM 改 kernel → 数值验证 + benchmark；SOL ≥ 95% 或最近 5 轮波动 < 0.1% 就早停。这条优化循环里的"数值验证"那一步复用的就是上面 agent loop 里的 verification 接口。
+**优化流水线（独立的第二条主线）**。`triton_kernel_agent/opt_worker.py` + `kernel_perf_agent/` 跑一个 6 步硬件感知循环：NCU 采 28 个指标 -> roofline 把 kernel 分类成 memory/compute/under-util -> LLM 诊断瓶颈 -> 从知识库（TMA / persistence / PID swizzle 等代码样例）检索"对症"技巧塞进 prompt -> LLM 改 kernel -> 数值验证 + benchmark；SOL >= 95% 或最近 5 轮波动 < 0.1% 就早停。这条优化循环里的"数值验证"那一步复用的就是上面 agent loop 里的 verification 接口。
 
 ![优化流水线 6 个 agent：Profiler / Judge / Analyzer / Orchestrator(History+RAG+Reflexion) / Optimization Manager(多 Opt-Agent 并行 + Top-K 队列) / Benchmarking](../pics/opt_agent.svg)
 
 **一个"硬"约束：防止 LLM 偷懒**。`worker.py` 顶部一长串 `DISALLOWED_TORCH_PATTERNS` 正则，禁止生成的 kernel 出现 `torch.matmul/mm/bmm/einsum`、`torch.nn`、`F.*`、`torch.ops.aten`、`inspect`、`sys._getframe` 等——必须真的写 Triton。检测命中直接当 violation，塞进 refinement 反馈让 LLM 下一轮改。
 
-## Part 2 — Verification 是怎么做的
+## Part 2 — Verification
 
-这是这个 repo 最值得抄的部分。Verification 不是单一一段代码，而是分布在 5 个地方、5 个层级。从"判定算对没"到"防作弊"再到"进程隔离"，每层都有可复用的设计。
 
 ### 2.1 数值正确性的核心：`examples/optimize_*/test.py`
 
-这是真正"算对没"的代码，标准结构：
+use to decide the kernel calculates correctly or not：
 
 ```python
 def test_kernel():
@@ -115,7 +124,7 @@ def _detect_pytorch_compute(kernel_code):
 - 用 `randn / rand`，**禁止全零输入**——零会掩盖空实现
 - 禁止 globals，禁止依赖 `kernel.py` 之外的 helper（NameError 必须暴露）
 
-两层缺一不可：只做静态扫，LLM 会用混淆字符串绕过；只写 prompt 约束，LLM 不一定遵守。
+两层缺一不可：只做静态regex扫，LLM 会用混淆字符串绕过；只写 prompt 约束，LLM 不一定遵守。
 
 ### 2.4 进程隔离：3 档强度
 
@@ -198,22 +207,3 @@ class ErrorStatsAccumulator:
 - **`rel_l2`**：相对 L2 误差 = `||out − ref||₂ / ||ref||₂` —— 跨 dtype 跨 scale 通用
 
 **数值稳定性关键**：误差用 fp32 算、平方和用 fp64 累。直接在 bf16 里 `sum` 误差会被自身精度吃掉，得到一个虚假的"小误差"。
-
-### 2.6 一份可以直接抄的 verification "最小套件"
-
-如果要从这个 repo 蒸出一套独立可复用的 verification stack：
-
-```text
-1. test 接口标准化：from kernel import kernel_function + sys.exit(0/1)
-2. subprocess.Popen + start_new_session=True + 进程组 SIGTERM→SIGKILL
-3. 子进程用 spawn context 而不是 fork (CUDA context 陷阱)
-4. 环境白名单 + 强制单线程 (PYTHONHASHSEED=0, OMP/MKL/OPENBLAS_NUM_THREADS=1)
-5. 网络阻断：sitecustomize.py monkey-patch socket
-6. 静态正则扫黑名单 op + frame introspection 防偷答案
-7. test prompt 硬约束：expected 不能传给 kernel、不能挂 globals、禁止全零输入
-8. dtype-aware 容差：bf16 用 1e-2/2e-2, 大累加维 1e-1, fp32 reference 强制降到目标 dtype
-9. 误差用 ErrorStatsAccumulator 给 max_abs / p99_abs / rel_l2 三件套, 别只信 allclose
-10. stdout/stderr 写文件, 失败只读 tail; 多 test 用 && 链式; sentinel 字符串作为退出码兜底
-```
-
-**最小起步**：抄 `examples/optimize_01_matvec/test.py` 的 `test_kernel()`；**生产级**：在它基础上加 `ErrorStatsAccumulator` 替换单一 `allclose`；**集成到 agent**：再套上 `worker.py:verify_with_refinement` 的 `(success, kernel_code, error_feedback)` 接口契约。
