@@ -111,11 +111,209 @@ In other words: batch invariance lets us drop the importance-weighting term enti
 
 
 ## Code review
+
+The whole library is just 4 pieces: 3 batch-invariant kernels (matmul / log_softmax / mean) + 1 global toggle mechanism that uses `torch.library` to override ATen ops. Each kernel below is contrasted against the "typical" implementation.
+
 ### 1. `matmul_kernel_persistent` — Matrix multiplication
-Design highlights
-- Persistent grid: grid = min(NUM_SMS, num_tiles) — launches exactly one program per SM, each consuming multiple tiles via for tile_id in tl.range(start_pid, num_tiles, NUM_SMS).
-- K-dim runs serially inside one program: each tile's K reduction completes in a single program through for ki in range(k_tiles). No split-K, ever.
-- Hard-coded BLOCK configs: (128, 128, 64) for bf16, (128, 256, 64) for fp16. No autotune.
-fp32 accumulator: accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32), even with bf16 inputs. Maps directly to Tensor Core wgmma.mma_async.bf16.f32.
-- L2-friendly super-grouping: _compute_pid remaps the linear tile_id into a "small-block-row × column-first" (pid_m, pid_n) layout, so concurrently active SMs share A row-bands and B column-bands.
-- Pipeline-friendly tile_id_c: tile_id_c = start_pid - NUM_SMS + per-iteration tile_id_c += NUM_SMS decouples the write-back coordinate from the K-accumulation chain, giving the compiler room to overlap "store of tile N" with "K-accumulation of tile N+1".
+
+**Design highlights**
+
+- **Persistent grid**: `grid = min(NUM_SMS, num_tiles)` — launches exactly one program per SM, each consuming multiple tiles via `for tile_id in tl.range(start_pid, num_tiles, NUM_SMS)`.
+- **K-dim runs serially inside one program**: each tile's K reduction completes in a single program through `for ki in range(k_tiles)`. **No split-K, ever.**
+- **Hard-coded BLOCK configs**: `(128, 128, 64)` for bf16, `(128, 256, 64)` for fp16, `(128, 128, 32)` for fp32. **No autotune.**
+- **FP32 accumulator**: `accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)`, even with bf16/fp16 inputs. Maps directly to Tensor Core `wgmma.mma_async.bf16.f32`.
+- **L2-friendly super-grouping**: `_compute_pid` remaps the linear `tile_id` into a "small-block-row × column-first" `(pid_m, pid_n)` layout, so concurrently active SMs share A row-bands and B column-bands.
+- **Pipeline-friendly `tile_id_c`**: `tile_id_c = start_pid - NUM_SMS` + per-iteration `tile_id_c += NUM_SMS` decouples the write-back coordinate from the K-accumulation chain, giving the compiler room to overlap "store of tile N" with "K-accumulation of tile N+1".
+
+**vs. a typical matmul kernel**
+
+| Aspect | Typical (cuBLAS / default Triton) | This implementation | Why the change |
+|---|---|---|---|
+| Grid shape | `(cdiv(M, BM), cdiv(N, BN), split_k)` | 1D persistent `min(NUM_SMS, num_tiles)` | Tile count is bound to SM count, so different batch sizes don't trigger different launch shapes |
+| K-dim reduction | Split-K when shapes are large (multiple programs accumulate into the same C tile) | Single program walks the full K | Split-K's partial sums use atomics / cross-program reduces → order changes → batch invariance breaks |
+| Tile size | `triton.autotune` picks the fastest config per (M, N, K) | dtype fixed → BLOCK fixed | Autotune picks different tiles at different batch sizes, so reduction order changes |
+| Small-batch optimization | At M=1 / small M, fall back to smaller mma instructions or even bypass Tensor Cores | Always the same code path, no switching | "Switching → different accumulation pattern → numerical drift" |
+
+**Snippet comparison**
+
+A typical split-K path (breaks invariance):
+
+```python
+# Under different KV lengths / batch sizes, autotune picks different SPLIT_K
+@triton.autotune(configs=[
+    triton.Config({'BLOCK_M':128,'BLOCK_N':128,'BLOCK_K':32,'SPLIT_K':1}),
+    triton.Config({'BLOCK_M':64, 'BLOCK_N':64, 'BLOCK_K':32,'SPLIT_K':4}),
+    triton.Config({'BLOCK_M':32, 'BLOCK_N':32, 'BLOCK_K':32,'SPLIT_K':8}),
+], key=['M','N','K'])
+@triton.jit
+def matmul_split_k(...):
+    pid_m, pid_n, pid_k = ...                       # 3D grid
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for ki in range(pid_k, k_tiles, SPLIT_K):       # each program sees only part of K
+        acc += tl.dot(a, b)
+    tl.atomic_add(c_ptr + ..., acc)                 # ← cross-program accumulation, order is non-deterministic
+```
+
+The batch-invariant version:
+
+```python
+# Pick config purely by dtype, never autotune; grid is 1D persistent
+configs = {torch.bfloat16: {'BLOCK_SIZE_M':128,'BLOCK_SIZE_N':128,'BLOCK_SIZE_K':64, ...}, ...}
+
+def grid(META):
+    return (min(NUM_SMS,
+                triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N'])),)
+
+@triton.jit
+def matmul_kernel_persistent(...):
+    start_pid = tl.program_id(0)
+    for tile_id in tl.range(start_pid, num_tiles, NUM_SMS, flatten=True):
+        pid_m, pid_n = _compute_pid(tile_id, ...)   # super-grouping, L2-friendly
+        accumulator = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+        for ki in range(k_tiles):                   # full K reduced inside a single program
+            accumulator = tl.dot(a, b, accumulator)
+        tl.store(c_ptrs, accumulator.to(c_ptr.dtype.element_ty))
+```
+
+Core idea: **trade "do less optimization" for "the K-accumulation sequence at every (m, n) is bitwise identical regardless of batch size"**. The cost is the ~20% slowdown vs. cuBLAS noted in §4b.
+
+### 2. `_log_softmax_kernel` — Log-softmax
+
+**Design highlights**
+
+- **One row per program**: `grid = (n_rows,)`, each row's program runs three passes (max → sum → write), with no cross-program communication within a row.
+- **Tiled in BLOCK but reduction stays in one program**: `for col_offset in range(0, n_cols, BLOCK_SIZE)` walks a row sequentially; both `tl.max` and `tl.sum` are confined to the same program.
+- **Standard three-pass numerical stability trick**: row max → `sum(exp(x - max))` → write `x - max - log(sum_exp)`. All three passes share the same program-private `max_val` / `sum_exp`, **so reduction order depends only on `n_cols` and is independent of batch (`n_rows`)**.
+- **Fixed `BLOCK_SIZE = 1024`**: like matmul, no autotune.
+
+**vs. a typical log_softmax**
+
+| Aspect | Typical | This implementation | Why |
+|---|---|---|---|
+| Intra-row reduction | Large vocab (e.g. 32k+) → split into multiple programs that partial-reduce, then a second-stage merge | Single program walks the full row | Two-stage merge ordering depends on launch order, breaking invariance |
+| `BLOCK_SIZE` | Autotune or vocab-adaptive | Fixed at 1024 | Same as above |
+| Row scheduling | One program per row (same as here) | Same | Rows are embarrassingly parallel — already invariant |
+
+**Snippet comparison**
+
+A typical "two-stage reduction" approach (breaks invariance):
+
+```python
+# Stage 1: split each row into chunks; each program computes its chunk's (max, sum)
+@triton.jit
+def stage1(...):
+    row, chunk = tl.program_id(0), tl.program_id(1)
+    local_max = tl.max(tl.load(...))
+    local_sum = tl.sum(tl.exp(... - local_max))
+    tl.atomic_max(global_max + row, local_max)      # ← cross-program merge
+    # ... another atomic pass to fix up sum
+```
+
+The batch-invariant version:
+
+```python
+@triton.jit
+def _log_softmax_kernel(input_ptr, output_ptr, ..., n_cols, BLOCK_SIZE: tl.constexpr):
+    row_idx = tl.program_id(0).to(tl.int64)         # one program per row
+
+    # Pass 1: serial max within the row
+    max_val = -float('inf')
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        vals = tl.load(...)
+        max_val = tl.max(tl.maximum(vals, max_val))
+
+    # Pass 2: serial sum(exp(x - max)) within the row
+    sum_exp = 0.0
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        sum_exp += tl.sum(tl.where(mask, tl.exp(vals - max_val), 0.0))
+
+    # Pass 3: write x - max - log(sum_exp)
+    log_sum_exp = tl.log(sum_exp)
+    for col_offset in range(0, n_cols, BLOCK_SIZE):
+        tl.store(..., vals - max_val - log_sum_exp)
+```
+
+Cost: when `n_cols` is huge (LM vocab), three serial sweeps of a row are slower than a parallel two-stage reduction — but this avoids the non-deterministic ordering of cross-program merges.
+
+### 3. `mean_kernel` — Mean along one dim
+
+**Design highlights**
+
+- **Unified 3D view**: any ndim tensor is reshaped to `(M, N, K)`, where **N is always the reduction dim**, M is the product of preceding dims, K is the product of trailing dims.
+- **One output element per program**: `grid = (M*K,)`, each program computes one scalar output by accumulating along N inside the program.
+- **Reduction is fully program-local**: `for n_start in range(0, N, BLOCK_SIZE): acc += tl.sum(tl.load(...))`. `acc` is program-private — no cross-program merging.
+- **Integer inputs auto-promote to fp32**, matching PyTorch's default behavior.
+
+**vs. a typical mean**
+
+| Aspect | Typical | This implementation | Why |
+|---|---|---|---|
+| Parallelizing the reduction dim | When N is large, split across multiple programs and merge via tree reduction / atomics | N is **always** serial; parallelism lives only in the (M, K) output space | Cross-program merging = non-deterministic order |
+| Multi-dim reduce | Single kernel handles multi-dim reduce | Multi-dim reduce falls back to `torch.sum` then divide by N (see `mean_batch_invariant`) | Reuse the single-dim invariant path, no need for a second multi-dim kernel |
+| Block size | Autotune | Fixed `BLOCK_SIZE = 1024` | Same as matmul: decouple accumulation order from batch |
+
+**Snippet comparison**
+
+A typical "split N + atomic merge" approach (breaks invariance):
+
+```python
+@triton.jit
+def mean_split(input_ptr, output_ptr, M, N, K, ...):
+    pid_mk, pid_n = tl.program_id(0), tl.program_id(1)   # N is also parallel
+    local = tl.sum(tl.load(...))
+    tl.atomic_add(output_ptr + pid_mk, local / N)        # ← order-sensitive
+```
+
+The batch-invariant version:
+
+```python
+@triton.jit
+def mean_kernel(input_ptr, output_ptr, ..., M, N, K, BLOCK_SIZE: tl.constexpr):
+    pid = tl.program_id(0)                              # one program → one output scalar
+    m_idx, k_idx = pid // K, pid % K
+
+    acc = 0.0
+    for n_start in range(0, N, BLOCK_SIZE):             # N is fully serial inside the program
+        n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
+        vals = tl.load(input_ptr + m_idx*s0 + n_offsets*s1 + k_idx*s2,
+                       mask=n_offsets < N, other=0.0)
+        acc += tl.sum(vals)
+
+    tl.store(output_ptr + m_idx*os0 + k_idx*os1, acc / N)
+```
+
+### 4. Toggle mechanism — global override via `torch.library`
+
+**Design highlights**
+
+- **No user code changes, no PyTorch fork, no recompile**: `torch.library.Library("aten", "IMPL")` re-registers ATen ops under a specified dispatch key (CUDA/XPU), directly overriding the default kernels.
+- **Overrides 4 ops**: `aten::mm`, `aten::addmm`, `aten::_log_softmax`, `aten::mean.dim`. Note that attention is fixed at the call site (write current K/V into the cache + fixed split size), **not hijacked here**.
+- **Process-wide toggle**: `enable_batch_invariant_mode()` / `disable_batch_invariant_mode()` manage a single global `_batch_invariant_LIB` handle; `disable` calls `_LIB._destroy()` to tear down the override.
+- **Scoped toggle**: `set_batch_invariant_mode` is a context manager that turns the override on at entry and restores the prior state on exit.
+- **Exposes an attention block-size constant**: `get_batch_invariant_attention_block_size()` returns `(16, 16)`, used by upstream attention kernels as the fixed split size.
+
+**Key code**
+
+```python
+def enable_batch_invariant_mode():
+    global _batch_invariant_MODE, _batch_invariant_LIB
+    if _batch_invariant_MODE:
+        return
+    dispatch_key = getattr(torch.accelerator.current_accelerator(), 'type', 'cpu').upper()
+    _batch_invariant_MODE = True
+    _batch_invariant_LIB = torch.library.Library('aten', 'IMPL')
+    _batch_invariant_LIB.impl('aten::mm',          mm_batch_invariant,           dispatch_key)
+    _batch_invariant_LIB.impl('aten::addmm',       addmm_batch_invariant,        dispatch_key)
+    _batch_invariant_LIB.impl('aten::_log_softmax', _log_softmax_batch_invariant, dispatch_key)
+    _batch_invariant_LIB.impl('aten::mean.dim',    mean_batch_invariant,         dispatch_key)
+```
+
+**vs. other "deterministic switch" approaches**
+
+| Approach | Effort | Caveats |
+|---|---|---|
+| Patch every kernel call site inside vLLM / SGLang | Heavy — every engine must be patched separately | Each engine upgrade requires re-patching |
+| Monkey-patch `torch.mm = ...` | One line, but only covers the Python layer | C++ call paths and `torch.compile` bypass the patch |
+| **`torch.library` re-IMPL (this approach)** | One-line registration | Takes effect at the dispatcher layer — covers Python + C++ + post-compile paths, and is isolated by dispatch key so CPU is untouched |
+
+This is the most elegant part of the library: **op replacement happens at the dispatcher layer, fully transparent to upstream code**, so the same user code in the same vLLM process can switch between deterministic and high-performance modes by wrapping a block in `with set_batch_invariant_mode():`.
