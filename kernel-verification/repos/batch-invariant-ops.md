@@ -104,6 +104,18 @@ Horace's experiments on BigMath with Qwen 2.5-VL 8B compare three configurations
 - With importance weighting: Training is stable. KL hovers around 0.001 with occasional spikes. This is the standard RLHF setup today.
 - True on-policy (batch-invariant kernels in both sampler and trainer): KL divergence is exactly 0 throughout training. No importance weighting needed. Training is stable.
 
-In other words: batch invariance lets us drop the importance-weighting term entirely and recover truly on-policy RL. This simplifies algorithms (PPO's `min(ratio·A, clip(ratio)·A)` collapses back to a vanilla policy gradient), removes a hyperparameter (clip range), and makes training fundamentally more stable.
+In other words: batch invariance lets us drop the importance-weighting term entirely and recover truly on-policy RL. This simplifies algorithms (PPO's `min(r atio·A, clip(ratio)·A)` collapses back to a vanilla policy gradient), removes a hyperparameter (clip range), and makes training fundamentally more stable.
 
 ![Figure 16 — Reward & KL divergence: True on-policy vs. importance weighting vs. no correction](../pics/Snipaste_2026-05-06_13-43-59.png)
+
+
+
+## Code review
+### 1. `matmul_kernel_persistent` — Matrix multiplication
+Design highlights
+- Persistent grid: grid = min(NUM_SMS, num_tiles) — launches exactly one program per SM, each consuming multiple tiles via for tile_id in tl.range(start_pid, num_tiles, NUM_SMS).
+- K-dim runs serially inside one program: each tile's K reduction completes in a single program through for ki in range(k_tiles). No split-K, ever.
+- Hard-coded BLOCK configs: (128, 128, 64) for bf16, (128, 256, 64) for fp16. No autotune.
+fp32 accumulator: accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32), even with bf16 inputs. Maps directly to Tensor Core wgmma.mma_async.bf16.f32.
+- L2-friendly super-grouping: _compute_pid remaps the linear tile_id into a "small-block-row × column-first" (pid_m, pid_n) layout, so concurrently active SMs share A row-bands and B column-bands.
+- Pipeline-friendly tile_id_c: tile_id_c = start_pid - NUM_SMS + per-iteration tile_id_c += NUM_SMS decouples the write-back coordinate from the K-accumulation chain, giving the compiler room to overlap "store of tile N" with "K-accumulation of tile N+1".
