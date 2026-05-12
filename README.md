@@ -10,6 +10,7 @@
 - [systems/](./systems/) — 调度、存储、网络(RDMA、IB)、容器化
 - [kernel-verification/](./kernel-verification/) — GPU kernel 正确性验证、数值一致性、自动生成
 - [agentic-rl/](./agentic-rl/) — Agent 化 RL、multi-agent / multi-LLM 训练框架
+- [verl/](./verl/) — verl (HybridFlow) RLHF 训练框架学习笔记
 - [papers/](./papers/) — 论文阅读笔记
 - [daily/](./daily/) — 按日期记录的学习日志
 - [assets/](./assets/) — 图片等资源
