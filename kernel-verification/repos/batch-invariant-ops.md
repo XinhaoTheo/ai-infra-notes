@@ -19,14 +19,55 @@ The most popular hypothesis in the community goes like this:
 
 This explanation appears in arXiv preprints, blog posts, and Stack Overflow answers everywhere. It sounds technical and authoritative.
 Horace shows it's wrong — at least for LLM inference — with a single counter-example:
+
+```python
+## Atomic version which is not used in nowdays LLM kernel
+__shared__ float acc;
+acc = 0;
+__syncthreads();
+atomic_add(&acc, my_partial);   # sequence is not fixed
+
+
+## Tree structure reduction
+__shared__ float partial[32];           # 32 slots
+partial[tid] = my_value;                # thread tid write to slot tid, the slot is fixed
+__syncthreads();                         # wait for all threads finished
+
+for (int stride = 16; stride > 0; stride /= 2) {
+    if (tid < stride) {
+        partial[tid] += partial[tid + stride];   # thread tid always add the number in fixed position
+    }
+    __syncthreads();                     # sync, every step will see fixed number
+}
+# final answer in partial[0]
+
+"""
+T0 v0 ──┐
+          (v0+v4)──┐
+  T4 v4 ──┘        │
+                   ((v0+v4)+(v2+v6))──┐
+  T2 v2 ──┐        │                  │
+          (v2+v6)──┘                  │
+  T6 v6 ──┘                           │
+                                      final
+  T1 v1 ──┐                           │
+          (v1+v5)──┐                  │
+  T5 v5 ──┘        │                  │
+                   ((v1+v5)+(v3+v7))──┘
+  T3 v3 ──┐        │
+          (v3+v7)──┘
+  T7 v7 ──┘
+"""
 ```
+
+```python
 A = torch.randn(2048, 2048, device='cuda', dtype=torch.bfloat16)
 B = torch.randn(2048, 2048, device='cuda', dtype=torch.bfloat16)
 ref = torch.mm(A, B)
 for _ in range(1000):
     assert (torch.mm(A, B) - ref).abs().max() == 0  # always passes!
 ```
-If "concurrency + floating point" were the real cause, this test should fail. The GPU is parallel; floating-point math is involved. Yet torch.mm returns bitwise-identical results 1000 times in a row. So the conventional story is missing something.
+If "concurrency + floating point" were the real cause, this above test should fail. The GPU is parallel; floating-point math is involved. Yet torch.mm returns bitwise-identical results 1000 times in a row. So the conventional story is missing something.
 The reason: modern GPU kernels for LLMs almost never use atomic adds. They use split reductions, tree reductions, or other deterministic strategies that achieve parallelism without sacrificing reproducibility. So GPU concurrency, by itself, is not the source of LLM nondeterminism.
 
 
@@ -43,9 +84,17 @@ out2 = torch.mm(a, b)[:1]        # process whole batch, take row 0
 print((out1 - out2).abs().max()) # tensor(1669.25) huge difference!
 ```
 
-Mathematically, row 0's output should be identical regardless of whether we batch it with other rows. But GPU matmul kernels switch internal strategies based on batch size — different tiles, different reduction orders, different tensor-core instructions — so the floating-point output drifts.
+Mathematically, row 0's output should be identical regardless of whether we batch it with other rows. **But GPU matmul kernels switch internal strategies based on batch size** — different tiles, different reduction orders, different tensor-core instructions — so the floating-point output drifts.
+
 **Why this makes LLM serving nondeterministic for users:** When you query an inference server, you don't know how many other people are simultaneously querying it. The server's load determines the batch size your request gets folded into, which determines which kernel path runs, which determines your exact output. From the server's perspective it's deterministic; from your perspective it's not.
 This is why the nondeterminism isn't unique to GPUs — CPU- or TPU-served LLM endpoints have the same problem.
+
+#### Affected selection within the kernel 
+1. **size of tile / block** Why this changes the reduction order: the K-dim loop advances by BLOCK_K each iteration. BLOCK_K=64 and BLOCK_K=32 produce completely different accumulation sequences for the same (m, n) output element — one does (K / 64) accumulations, the other does (K / 32). Every accumulation is a floating-point add, so a different number of steps → a different accumulation error.
+2. **Whether Split-K is enabled** Large batch (M, N both big): plenty of tiles to go around so each SM owns one (m, n) this makes the entire K reduction stays serial inside a single program. Small batch (M = 1): few tiles, most SMs sit idle, kernel falls back to Split-K: chop the K dim into segments, let several programs each compute a partial sum, then atomic_add them into the same C[m, n].
+3. Tensor core instruction selection `wgmma.mma_async.bf16.f32`, `mma.sync.aligned.m16n8k16`
+4. Shape of Grid. in directly `grid = (cdiv(M, BLOCK_M), cdiv(N, BLOCK_N))`
+
 
 
 ### 4. The Fix: Making Three Critical Kernels Batch-Invariant
@@ -123,7 +172,7 @@ The whole library is just 4 pieces: 3 batch-invariant kernels (matmul / log_soft
 - **Hard-coded BLOCK configs**: `(128, 128, 64)` for bf16, `(128, 256, 64)` for fp16, `(128, 128, 32)` for fp32. **No autotune.**
 - **FP32 accumulator**: `accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)`, even with bf16/fp16 inputs. Maps directly to Tensor Core `wgmma.mma_async.bf16.f32`.
 - **L2-friendly super-grouping**: `_compute_pid` remaps the linear `tile_id` into a "small-block-row × column-first" `(pid_m, pid_n)` layout, so concurrently active SMs share A row-bands and B column-bands.
-- **Pipeline-friendly `tile_id_c`**: `tile_id_c = start_pid - NUM_SMS` + per-iteration `tile_id_c += NUM_SMS` decouples the write-back coordinate from the K-accumulation chain, giving the compiler room to overlap "store of tile N" with "K-accumulation of tile N+1".
+- **Pipeline-friendly `tile_id_c`**: `tile_id_c = start_pid - NUM_SMS` + per-iteration `tile_id_c += NUM_SMS` decouples the write-back coordinate from the K-accumulation chain, It lets the compiler work out the destination address in advance, instead of having to wait for the K-loop to wrap up before it even knows where to put the result. This gives the compiler room to overlap "store of tile N" with "K-accumulation of tile N+1".
 
 **vs. a typical matmul kernel**
 
