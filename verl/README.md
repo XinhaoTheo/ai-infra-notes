@@ -13,10 +13,13 @@
 ## 笔记目录
 
 - [overview.md](overview.md) — 框架总览、核心抽象（待写）
+- [rollout.md](rollout.md) — Rollout 优化：FSDP+vLLM 与 Megatron+vLLM 两条 ShardingManager 路径
+- [flow.md](flow.md) — FSDP+vLLM 全流程梳理：init / stage1–3 一条龙
+- [parallelism-comm.md](parallelism-comm.md) — 补充：DP / TP / PP 三种并行的通信时机与原语对比
+- [ray.md](ray.md) — verl 的 Ray：single-controller / multi-controller 数据流与计算流解耦
 - 后续按主题拆分：
   - `hybrid-flow.md` — HybridFlow 编程模型 / single-controller + multi-controller
   - `worker-and-resource.md` — WorkerGroup / RayResourcePool / 角色调度
-  - `rollout.md` — 推理后端（vLLM / SGLang）集成与 rollout 流程
   - `actor-critic.md` — Actor / Critic / Reference / Reward 各角色训练后端（FSDP / Megatron）
   - `algorithms.md` — PPO / GRPO / DAPO / RLOO 等算法实现细节
   - `recipes.md` — 官方 recipe 解读（math、tool-use、multi-turn、agent loop）
