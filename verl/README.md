@@ -17,6 +17,7 @@
 - [flow.md](flow.md) — FSDP+vLLM 全流程梳理：init / stage1–3 一条龙
 - [parallelism-comm.md](parallelism-comm.md) — 补充：DP / TP / PP 三种并行的通信时机与原语对比
 - [ray.md](ray.md) — verl 的 Ray：single-controller / multi-controller 数据流与计算流解耦
+- [agentloop.md](agentloop.md) — PPO/GRPO 算法流程 + AgentLoop 架构（agent RL 应用层）
 - 后续按主题拆分：
   - `hybrid-flow.md` — HybridFlow 编程模型 / single-controller + multi-controller
   - `worker-and-resource.md` — WorkerGroup / RayResourcePool / 角色调度

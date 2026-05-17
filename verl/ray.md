@@ -64,6 +64,8 @@ actor_workers.update(batch)                      # 训 actor
 
 ## 4. WorkerGroup:把一组 worker抽象出来
 
+![Driver Process / WorkerGroup / Resource Pool 三层视图:Actor / Critic / Rollout / Reference / Reward 五个角色各自有自己的 WorkerGroup,通过 ResourcePool 绑定到一组 GPU 上,Driver 通过 Call API + Receive Future 与每个 WorkerGroup 异步交互](pics/controller_compute_seperate.jpg)
+
 既然一个角色不再是一个对象、而是**一组各占 1 GPU 的 worker**,就需要一套东西来统一管理它们——这就是 `RayWorkerGroup`。对 RL 里的每个 role(actor/critic/ref/reward),都有一组 ray worker + 一组 GPU 构成对应的 WorkerGroup。在最简化的 demo 里,WorkerGroup 就是一个 `List[Worker]`,verl 的实现接口更干净,但定位一样。
 
 每个 `RayWorkerGroup` 初始化要传两样东西:
