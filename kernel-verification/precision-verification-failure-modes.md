@@ -56,6 +56,30 @@ top-k 常用 radix select 实现。先把 float 做一个单调的 bit 变换（
 
 所以这一类的正确判法不是「数对了几个 index」，而是按被丢元素相对保留集合的 value gap 加权：gap 约等于 0 不罚，gap 大重罚——这样天然把「无害的边界 swap」和「灾难性的大值漏选」分开了。极端一点的做法是干脆别比 index，直接比最终的下游输出 `softmax(q@k[I]/√d)·V[I]`，让正确性回到一个有数值距离的量上。
 
+### 真实代码对照：vortex_torch 的 approx top-k
+
+上面的机制可以直接在 [Infini-AI-Lab/vortex_torch](https://github.com/Infini-AI-Lab/vortex_torch)（分支 `v0.5`，`custom_ops/topk_output/flashinfer/approx/`）的 `kernel.cu` 里逐行对上。它是个自适应 1~2 轮的 8-bit radix select（同目录的 `default` 是 CUB 全排序精确版，`k_96/128/256` 是小 k 的精确 radix 版，只有 `approx` 是近似的）。`tolerate_ratio` 经 `dispatch.py` 烤成编译期常量 `__TOLERATE_RATIO__`：`=1.0` 永远单轮（最糙），`=0.0` 边界桶有歧义就走两轮（最紧，默认值）。
+
+它先用 `score_to_key32` 把 fp32 做单调 bit 变换（正数置符号位、负数全翻，让无符号整数比大小等价于 float 比大小，符号位 / 负数都处理对了，所以「bit 变换写错」在这里不是隐患）。Pass 1 对最高字节（`>>24`）做直方图 + 反向前缀和，找到「计数跨过 k」的边界桶 `tbin0`，算出还需从这个桶里抓 `last_remain0` 个；如果 `last_remain0 <= tolerate_ratio*k` 就单轮直接填，否则用次高字节（`>>16`）再细分一轮（Pass 2 只「数」次高字节直方图 + 顺手发 byte-0 铁定赢家，Pass 3 才按 `tbin1`「写」）。
+
+单轮 / Pass 3 的 emit 是理解全部近似性的关键，机制在于 `atomicAdd` 返回「加之前的旧值」，本质是个领号机：
+
+```cpp
+if (bin > tbin0) {                                   // strict winner（高位 bit 明显大）
+    const int pos = ::atomicAdd(&s_counter, 1);      // 从 0 往上领号
+    index[pos] = idx;                                // 填到 index 前段，一个不少
+} else if (bin == tbin0) {                           // 边界桶（高位 bit 跟保留项相同 = 值极接近）
+    const int pos = ::atomicAdd(&s_last_remain, -1); // 从 last_remain0 往下领号
+    if (pos > 0) index[target_k - pos] = idx;        // 抢到正号的填 index 后段，号发完就丢
+}
+```
+
+两个计数器从两端往中间填，正好拼满 `target_k`、不重叠，这部分精确正确。近似只发生在边界桶：预算 `last_remain0` 个坑发完，后到的线程 `pos <= 0` 直接不写，留谁丢谁纯看 `atomicAdd` 谁先执行（race）。三个结论直接对上前面的论断：
+
+第一，**strict winner 永不丢**——它高位 bit 明显大，第一轮就铁定入选，这个 kernel 从构造上保证「所有 miss 都是边界 miss（被丢的和被选的值极接近）」。所以 verifier 一旦发现一个 strict winner 被丢了，那就是真 bug，不是近似。第二，**index recall 当判据根本不行**：race 顺序不确定，同一输入跑两次选出的 index 集合都可能不同，它连「kernel 自己跟自己比」都过不了 100%，要判对错只能比选中值或下游 `o`。第三，**`tolerate_ratio` 就是「近似激进程度 / false-accept」旋钮**：randn 下边界桶瘦，`ratio=1.0` 也没事；BF16 / 打平下边界桶巨胖，`ratio=1.0` 会把一大把任意顺序的 tie 糊进去——这正是 distribution-dependent false accept。验证应把 `tolerate_ratio` 当被测维度，在打平 / 低精度分布下扫它，看输出何时开始崩。
+
+一个 BF16 细节正好是 false reject 的代码出处：BF16 先 `__bfloat162float` 升 fp32（低 16 bit 补零），所以两轮（16 bit）对 BF16 其实是精确的，但 BF16 真·相等的打平极多，这些全等值进边界桶按 race 填，对稳定排序参考做 recall 必然 < 100%——kernel 是对的，是指标在冤枉它。
+
 ---
 
 ## 第 3 类：softmax / activation + FP8
